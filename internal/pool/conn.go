@@ -1,67 +1,55 @@
 package pool
 
 import (
+	"bufio"
+	"context"
 	"net"
 	"sync/atomic"
 	"time"
 
-	"github.com/go-redis/redis/internal/proto"
+	"github.com/go-redis/redis/v8/internal/proto"
 )
 
 var noDeadline = time.Time{}
 
 type Conn struct {
+	usedAt  int64 // atomic
 	netConn net.Conn
 
-	rd       *proto.Reader
-	rdLocked bool
-	wr       *proto.Writer
+	rd *proto.Reader
+	bw *bufio.Writer
+	wr *proto.Writer
 
-	InitedAt time.Time
-	pooled   bool
-	usedAt   atomic.Value
+	Inited    bool
+	pooled    bool
+	createdAt time.Time
 }
 
 func NewConn(netConn net.Conn) *Conn {
 	cn := &Conn{
-		netConn: netConn,
+		netConn:   netConn,
+		createdAt: time.Now(),
 	}
 	cn.rd = proto.NewReader(netConn)
-	cn.wr = proto.NewWriter(netConn)
+	cn.bw = bufio.NewWriter(netConn)
+	cn.wr = proto.NewWriter(cn.bw)
 	cn.SetUsedAt(time.Now())
 	return cn
 }
 
 func (cn *Conn) UsedAt() time.Time {
-	return cn.usedAt.Load().(time.Time)
+	unix := atomic.LoadInt64(&cn.usedAt)
+	return time.Unix(unix, 0)
 }
 
 func (cn *Conn) SetUsedAt(tm time.Time) {
-	cn.usedAt.Store(tm)
+	atomic.StoreInt64(&cn.usedAt, tm.Unix())
 }
 
 func (cn *Conn) SetNetConn(netConn net.Conn) {
 	cn.netConn = netConn
 	cn.rd.Reset(netConn)
-	cn.wr.Reset(netConn)
-}
-
-func (cn *Conn) setReadTimeout(timeout time.Duration) error {
-	now := time.Now()
-	cn.SetUsedAt(now)
-	if timeout > 0 {
-		return cn.netConn.SetReadDeadline(now.Add(timeout))
-	}
-	return cn.netConn.SetReadDeadline(noDeadline)
-}
-
-func (cn *Conn) setWriteTimeout(timeout time.Duration) error {
-	now := time.Now()
-	cn.SetUsedAt(now)
-	if timeout > 0 {
-		return cn.netConn.SetWriteDeadline(now.Add(timeout))
-	}
-	return cn.netConn.SetWriteDeadline(noDeadline)
+	cn.bw.Reset(netConn)
 }
 
 func (cn *Conn) Write(b []byte) (int, error) {
@@ -69,25 +57,65 @@ func (cn *Conn) Write(b []byte) (int, error) {
 }
 
 func (cn *Conn) RemoteAddr() net.Addr {
-	return cn.netConn.RemoteAddr()
+	if cn.netConn != nil {
+		return cn.netConn.RemoteAddr()
+	}
+	return nil
 }
 
-func (cn *Conn) WithReader(timeout time.Duration, fn func(rd *proto.Reader) error) error {
-	_ = cn.setReadTimeout(timeout)
+func (cn *Conn) WithReader(ctx context.Context, timeout time.Duration, fn func(rd *proto.Reader) error) error {
+	if err := cn.netConn.SetReadDeadline(cn.deadline(ctx, timeout)); err != nil {
+		return err
+	}
 	return fn(cn.rd)
 }
 
-func (cn *Conn) WithWriter(timeout time.Duration, fn func(wr *proto.Writer) error) error {
-	_ = cn.setWriteTimeout(timeout)
-
-	firstErr := fn(cn.wr)
-	err := cn.wr.Flush()
-	if err != nil && firstErr == nil {
-		firstErr = err
+func (cn *Conn) WithWriter(
+	ctx context.Context, timeout time.Duration, fn func(wr *proto.Writer) error,
+) error {
+	if err := cn.netConn.SetWriteDeadline(cn.deadline(ctx, timeout)); err != nil {
+		return err
 	}
-	return firstErr
+
+	if cn.bw.Buffered() > 0 {
+		cn.bw.Reset(cn.netConn)
+	}
+
+	if err := fn(cn.wr); err != nil {
+		return err
+	}
+
+	return cn.bw.Flush()
 }
 
 func (cn *Conn) Close() error {
 	return cn.netConn.Close()
+}
+
+func (cn *Conn) deadline(ctx context.Context, timeout time.Duration) time.Time {
+	tm := time.Now()
+	cn.SetUsedAt(tm)
+
+	if timeout > 0 {
+		tm = tm.Add(timeout)
+	}
+
+	if ctx != nil {
+		deadline, ok := ctx.Deadline()
+		if ok {
+			if timeout == 0 {
+				return deadline
+			}
+			if deadline.Before(tm) {
+				return deadline
+			}
+			return tm
+		}
+	}
+
+	if timeout > 0 {
+		return tm
+	}
+
+	return noDeadline
 }

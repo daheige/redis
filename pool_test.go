@@ -1,9 +1,10 @@
 package redis_test
 
 import (
+	"context"
 	"time"
 
-	"github.com/go-redis/redis"
+	"github.com/go-redis/redis/v8"
 
 	. "github.com/onsi/ginkgo"
 	. "github.com/onsi/gomega"
@@ -16,8 +17,8 @@ var _ = Describe("pool", func() {
 		opt := redisOptions()
 		opt.MinIdleConns = 0
 		opt.MaxConnAge = 0
+		opt.IdleTimeout = time.Second
 		client = redis.NewClient(opt)
-		Expect(client.FlushDB().Err()).NotTo(HaveOccurred())
 	})
 
 	AfterEach(func() {
@@ -26,7 +27,7 @@ var _ = Describe("pool", func() {
 
 	It("respects max size", func() {
 		perform(1000, func(id int) {
-			val, err := client.Ping().Result()
+			val, err := client.Ping(ctx).Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(val).To(Equal("PONG"))
 		})
@@ -41,9 +42,9 @@ var _ = Describe("pool", func() {
 		perform(1000, func(id int) {
 			var ping *redis.StatusCmd
 
-			err := client.Watch(func(tx *redis.Tx) error {
-				cmds, err := tx.Pipelined(func(pipe redis.Pipeliner) error {
-					ping = pipe.Ping()
+			err := client.Watch(ctx, func(tx *redis.Tx) error {
+				cmds, err := tx.Pipelined(ctx, func(pipe redis.Pipeliner) error {
+					ping = pipe.Ping(ctx)
 					return nil
 				})
 				Expect(err).NotTo(HaveOccurred())
@@ -65,8 +66,8 @@ var _ = Describe("pool", func() {
 	It("respects max size on pipelines", func() {
 		perform(1000, func(id int) {
 			pipe := client.Pipeline()
-			ping := pipe.Ping()
-			cmds, err := pipe.Exec()
+			ping := pipe.Ping(ctx)
+			cmds, err := pipe.Exec(ctx)
 			Expect(err).NotTo(HaveOccurred())
 			Expect(cmds).To(HaveLen(1))
 			Expect(ping.Err()).NotTo(HaveOccurred())
@@ -81,15 +82,15 @@ var _ = Describe("pool", func() {
 	})
 
 	It("removes broken connections", func() {
-		cn, err := client.Pool().Get()
+		cn, err := client.Pool().Get(context.Background())
 		Expect(err).NotTo(HaveOccurred())
 		cn.SetNetConn(&badConn{})
-		client.Pool().Put(cn)
+		client.Pool().Put(ctx, cn)
 
-		err = client.Ping().Err()
+		err = client.Ping(ctx).Err()
 		Expect(err).To(MatchError("bad connection"))
 
-		val, err := client.Ping().Result()
+		val, err := client.Ping(ctx).Result()
 		Expect(err).NotTo(HaveOccurred())
 		Expect(val).To(Equal("PONG"))
 
@@ -98,14 +99,21 @@ var _ = Describe("pool", func() {
 		Expect(pool.IdleLen()).To(Equal(1))
 
 		stats := pool.Stats()
-		Expect(stats.Hits).To(Equal(uint32(2)))
+		Expect(stats.Hits).To(Equal(uint32(1)))
 		Expect(stats.Misses).To(Equal(uint32(2)))
 		Expect(stats.Timeouts).To(Equal(uint32(0)))
 	})
 
 	It("reuses connections", func() {
+		// explain: https://github.com/go-redis/redis/pull/1675
+		opt := redisOptions()
+		opt.MinIdleConns = 0
+		opt.MaxConnAge = 0
+		opt.IdleTimeout = 2 * time.Second
+		client = redis.NewClient(opt)
+
 		for i := 0; i < 100; i++ {
-			val, err := client.Ping().Result()
+			val, err := client.Ping(ctx).Result()
 			Expect(err).NotTo(HaveOccurred())
 			Expect(val).To(Equal("PONG"))
 		}
@@ -115,12 +123,15 @@ var _ = Describe("pool", func() {
 		Expect(pool.IdleLen()).To(Equal(1))
 
 		stats := pool.Stats()
-		Expect(stats.Hits).To(Equal(uint32(100)))
+		Expect(stats.Hits).To(Equal(uint32(99)))
 		Expect(stats.Misses).To(Equal(uint32(1)))
 		Expect(stats.Timeouts).To(Equal(uint32(0)))
 	})
 
 	It("removes idle connections", func() {
+		err := client.Ping(ctx).Err()
+		Expect(err).NotTo(HaveOccurred())
+
 		stats := client.PoolStats()
 		Expect(stats).To(Equal(&redis.PoolStats{
 			Hits:       0,
